@@ -1,0 +1,10 @@
+[2024-03-15T10:00:05.123+0000][info][gc] GC(0) Pause Young (Normal) (G1 Evacuation Pause) 512M->485M(2048M) 28.450ms
+[2024-03-15T10:00:22.456+0000][info][gc] GC(1) Pause Young (Normal) (G1 Evacuation Pause) 760M->590M(2048M) 35.120ms
+[2024-03-15T10:00:45.789+0000][info][gc] GC(2) Pause Young (Concurrent Start) (G1 Humongous Allocation) 900M->720M(2048M) 42.300ms
+[2024-03-15T10:01:10.001+0000][info][gc] GC(3) Pause Full (Allocation Failure) 1800M->900M(2048M) 350.780ms
+[2024-03-15T10:01:35.222+0000][info][gc] GC(4) Pause Young (Normal) (G1 Evacuation Pause) 650M->520M(2048M) 31.200ms
+[2024-03-15T10:02:00.333+0000][info][gc] GC(5) Pause Young (Normal) (Ergonomics) 780M->610M(2048M) 29.900ms
+[2024-03-15T10:02:30.444+0000][info][gc] GC(6) Pause Full (System.gc()) 1600M->700M(2048M) 420.100ms
+[2024-03-15T10:03:00.555+0000][info][gc] GC(7) Pause Young (Normal) (G1 Evacuation Pause) 850M->680M(2048M) 38.500ms
+[2024-03-15T10:03:25.666+0000][info][gc] GC(8) Pause Young (Normal) (G1 Evacuation Pause) 920M->750M(2048M) 44.200ms
+[2024-03-15T10:03:50.777+0000][info][gc] GC(9) Pause Full (Allocation Failure) 1950M->1000M(2048M) 510.330ms
