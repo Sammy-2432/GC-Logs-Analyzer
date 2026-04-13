@@ -205,8 +205,87 @@ def parse_gc_log_streaming(file_obj) -> pd.DataFrame:
 # JTL PARSER
 # ─────────────────────────────────────────────
 
-def parse_jtl(file_obj) -> pd.DataFrame:
-    """Parse JMeter JTL / CSV results file."""
+def _parse_jtl_xml(file_obj) -> pd.DataFrame:
+    """
+    Parse JMeter JTL in XML format.
+
+    Handles both full <testResults> documents and error-only exports.
+    Parses <httpSample> / <sample> elements and their <assertionResult> children.
+
+    XML attributes read per sample
+    --------------------------------
+    ts / timeStamp  – start epoch ms
+    t  / elapsed    – response time ms
+    lb / label      – transaction label
+    s  / success    – "true" / "false"
+    rc / responseCode
+    rm / responseMessage
+    by / bytes
+    lt / latency
+    ct / connect
+
+    Child tags parsed
+    -----------------
+    <assertionResult>
+        <failure>          true/false
+        <failureMessage>   text
+    """
+    import xml.etree.ElementTree as ET
+
+    raw = file_obj.read()
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError as exc:
+        raise ValueError(f"XML parse error in JTL file: {exc}") from exc
+
+    records = []
+    for elem in root.iter():
+        if elem.tag not in ("httpSample", "sample"):
+            continue
+
+        ts_raw = elem.get("ts") or elem.get("timeStamp")
+        if ts_raw is None:
+            continue
+
+        # Collect assertion failures from child <assertionResult> elements
+        assertion_failed  = False
+        failure_messages  = []
+        for ar in elem.findall("assertionResult"):
+            fail_el = ar.find("failure")
+            if fail_el is not None and (fail_el.text or "").strip().lower() == "true":
+                assertion_failed = True
+                msg_el = ar.find("failureMessage")
+                if msg_el is not None and msg_el.text:
+                    failure_messages.append(msg_el.text.strip())
+
+        s_attr  = (elem.get("s") or elem.get("success") or "true").strip().lower()
+        success = (s_attr == "true") and (not assertion_failed)
+
+        records.append({
+            "timestamp":        int(ts_raw),
+            "response_time_ms": float(elem.get("t") or elem.get("elapsed") or 0),
+            "label":            elem.get("lb") or elem.get("label") or "unknown",
+            "success":          "true" if success else "false",
+            "response_code":    elem.get("rc") or elem.get("responseCode") or "",
+            "response_message": elem.get("rm") or elem.get("responseMessage") or "",
+            "bytes":            int(elem.get("by") or elem.get("bytes") or 0),
+            "latency_ms":       float(elem.get("lt") or elem.get("latency") or 0),
+            "connect_ms":       float(elem.get("ct") or elem.get("connect") or 0),
+            "failure_message":  " | ".join(failure_messages) if failure_messages else "",
+        })
+
+    if not records:
+        raise ValueError("No <httpSample> or <sample> elements found in JTL XML.")
+
+    df = pd.DataFrame(records)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df.sort_values("timestamp", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+
+def _parse_jtl_csv(file_obj) -> pd.DataFrame:
+    """Parse JMeter JTL in CSV format."""
     df = pd.read_csv(file_obj)
     col_map = {}
     for c in df.columns:
@@ -223,15 +302,35 @@ def parse_jtl(file_obj) -> pd.DataFrame:
             col_map[c] = "bytes"
         elif lc in ("connect", "connect_time"):
             col_map[c] = "connect_ms"
+        elif lc in ("responsecode", "response_code", "rc"):
+            col_map[c] = "response_code"
     df.rename(columns=col_map, inplace=True)
 
     if "timestamp" not in df.columns:
-        raise ValueError("JTL file has no recognisable timestamp column.")
+        raise ValueError("JTL CSV has no recognisable timestamp column.")
 
     if df["timestamp"].dtype in (np.int64, np.float64):
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     else:
         df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+    if "response_time_ms" not in df.columns:
+        df["response_time_ms"] = np.nan
+    return df
+
+
+def parse_jtl(file_obj) -> pd.DataFrame:
+    """
+    Auto-detect JTL format (XML or CSV) and parse accordingly.
+    XML is identified by the file beginning with '<' after stripping whitespace.
+    """
+    raw    = file_obj.read()
+    is_xml = raw.lstrip()[:1] == b"<"
+
+    if is_xml:
+        df = _parse_jtl_xml(io.BytesIO(raw))
+    else:
+        df = _parse_jtl_csv(io.BytesIO(raw))
 
     if "response_time_ms" not in df.columns:
         df["response_time_ms"] = np.nan
@@ -651,13 +750,41 @@ with st.sidebar:
     st.markdown("##### 📂 Upload Files")
 
     gc_file  = st.file_uploader(
-        "GC Log (.log / .txt)", type=["log", "txt"],
-        help="Supports G1GC, CMS, Parallel GC unified log formats",
+        "GC Log (.log / .txt)",
+        type=["log", "txt"],
+        help="Supports JDK 9+ Unified Logging (G1GC, CMS, Parallel, ZGC) and classic -verbose:gc format",
     )
+
+    st.markdown("""
+    <div style='font-size:10px; color:#475569; margin:-8px 0 6px 0; line-height:1.5'>
+        JTL files accepted in <b style='color:#38bdf8'>XML</b> <i>or</i>
+        <b style='color:#38bdf8'>CSV</b> format — auto-detected on upload
+    </div>
+    """, unsafe_allow_html=True)
+
     jtl_file = st.file_uploader(
-        "JTL / CSV (JMeter)", type=["jtl", "csv"],
-        help="JMeter results CSV with timestamp + elapsed columns",
+        "JTL Results (XML or CSV)",
+        type=["jtl", "csv", "xml"],
+        help=(
+            "XML (.jtl): JMeter error/full export with <httpSample> or <sample> tags, "
+            "<assertionResult>, <failure>, <failureMessage>\n"
+            "CSV (.jtl / .csv): JMeter results CSV with timestamp + elapsed columns"
+        ),
     )
+
+    # Show detected format badge once a file is uploaded
+    if jtl_file is not None:
+        peek = jtl_file.read(16)
+        jtl_file.seek(0)
+        detected = "XML" if peek.lstrip()[:1] == b"<" else "CSV"
+        badge_color = "#0ea5e9" if detected == "XML" else "#10b981"
+        st.markdown(
+            f"<div style='font-size:11px; margin-top:-6px; margin-bottom:8px'>"
+            f"Detected format: <span style='background:{badge_color}22; color:{badge_color}; "
+            f"border:1px solid {badge_color}44; padding:1px 8px; border-radius:20px; "
+            f"font-family:JetBrains Mono,monospace; font-weight:700'>{detected}</span></div>",
+            unsafe_allow_html=True,
+        )
 
     st.markdown("---")
     st.markdown("##### ⚙️ Analysis Settings")
@@ -670,11 +797,16 @@ with st.sidebar:
     use_demo = st.checkbox("🎲 Use synthetic demo data", value=(gc_file is None))
 
     st.markdown("""
-    <div style='font-size:10px; color:#334155; padding-top:16px; line-height:1.6'>
-        Supported GC log formats:<br>
-        • JDK 9+ Unified Logging (-Xlog:gc*)<br>
+    <div style='font-size:10px; color:#334155; padding-top:16px; line-height:1.8'>
+        <b style='color:#475569'>GC log formats:</b><br>
+        • JDK 9+ Unified Logging (<code>-Xlog:gc*</code>)<br>
         • G1GC, CMS, Parallel, ZGC<br>
-        • JMeter JTL / CSV export
+        • Classic <code>-verbose:gc</code><br>
+        <br>
+        <b style='color:#475569'>JTL formats:</b><br>
+        • XML — <code>&lt;httpSample&gt;</code> / <code>&lt;sample&gt;</code><br>
+        • XML — <code>&lt;assertionResult&gt;</code> children<br>
+        • CSV — standard JMeter columns
     </div>
     """, unsafe_allow_html=True)
 
@@ -698,12 +830,25 @@ with st.spinner("⚙️ Parsing logs..."):
         gc_df       = generate_demo_gc()
         jtl_df      = generate_demo_jtl(gc_df)
         data_source = "🎲 Demo"
+        jtl_format  = "demo"
     else:
         gc_df = load_gc(gc_file.read())
         if gc_df.empty:
             st.error("❌ Could not parse GC log. Ensure it's a valid JDK unified or classic GC log.")
             st.stop()
-        jtl_df      = load_jtl(jtl_file.read()) if jtl_file else pd.DataFrame()
+
+        jtl_df     = pd.DataFrame()
+        jtl_format = None
+        if jtl_file is not None:
+            raw_peek   = jtl_file.read(16)
+            jtl_file.seek(0)
+            jtl_format = "XML" if raw_peek.lstrip()[:1] == b"<" else "CSV"
+            try:
+                jtl_df = load_jtl(jtl_file.read())
+            except Exception as e:
+                st.error(f"❌ Could not parse JTL file ({jtl_format}): {e}")
+                jtl_df = pd.DataFrame()
+
         data_source = f"📁 {gc_file.name}"
 
 ts_df   = build_time_series(gc_df, jtl_df, bucket_secs)
@@ -719,6 +864,18 @@ spikes  = detect_latency_spikes(ts_df, sigma=sigma_thresh)
 time_min = gc_df["timestamp"].min().strftime("%Y-%m-%d %H:%M") if not gc_df.empty else "—"
 time_max = gc_df["timestamp"].max().strftime("%Y-%m-%d %H:%M") if not gc_df.empty else "—"
 
+# Build JTL format pill for the header
+if jtl_format == "XML":
+    jtl_pill = "<span style='background:#0ea5e922; color:#0ea5e9; border:1px solid #0ea5e944; "                "padding:1px 8px; border-radius:20px; font-size:11px; "                "font-family:JetBrains Mono,monospace; font-weight:700'>JTL XML</span>"
+elif jtl_format == "CSV":
+    jtl_pill = "<span style='background:#10b98122; color:#10b981; border:1px solid #10b98144; "                "padding:1px 8px; border-radius:20px; font-size:11px; "                "font-family:JetBrains Mono,monospace; font-weight:700'>JTL CSV</span>"
+elif jtl_format == "demo":
+    jtl_pill = "<span style='background:#6366f122; color:#818cf8; border:1px solid #6366f144; "                "padding:1px 8px; border-radius:20px; font-size:11px; "                "font-family:JetBrains Mono,monospace; font-weight:700'>Demo</span>"
+else:
+    jtl_pill = ""
+
+jtl_badge_html = f"&nbsp;·&nbsp; {jtl_pill}" if jtl_pill else ""
+
 st.markdown(f"""
 <div style='display:flex; align-items:center; justify-content:space-between;
             border-bottom:1px solid #1e2d47; padding-bottom:16px; margin-bottom:20px'>
@@ -729,7 +886,7 @@ st.markdown(f"""
         </div>
         <div style='font-size:12px; color:#475569; margin-top:3px'>
             {data_source} &nbsp;·&nbsp; {len(gc_df):,} GC events &nbsp;·&nbsp;
-            {len(jtl_df):,} requests &nbsp;·&nbsp; Bucket: {bucket_secs}s
+            {len(jtl_df):,} requests{jtl_badge_html} &nbsp;·&nbsp; Bucket: {bucket_secs}s
         </div>
     </div>
     <div style='font-size:11px; color:#334155; font-family:JetBrains Mono,monospace; text-align:right'>
@@ -861,7 +1018,7 @@ if not corr_df.empty and not jtl_df.empty:
 # ─────────────────────────────────────────────
 
 section("Raw Data", "📋")
-tab1, tab2, tab3 = st.tabs(["GC Events", "Time-Series Buckets", "GC Storms"])
+tab1, tab2, tab3, tab4 = st.tabs(["GC Events", "JTL Requests", "Time-Series Buckets", "GC Storms"])
 
 with tab1:
     show_cols = [c for c in ["timestamp", "gc_type", "cause", "pause_ms",
@@ -879,13 +1036,63 @@ with tab1:
     )
 
 with tab2:
+    if jtl_df.empty:
+        st.info("No JTL file loaded.")
+    else:
+        jtl_show = [c for c in ["timestamp", "label", "response_time_ms", "success",
+                                  "response_code", "response_message", "bytes",
+                                  "latency_ms", "connect_ms", "failure_message"]
+                    if c in jtl_df.columns]
+        # Highlight failures in red using Styler
+        jtl_display = jtl_df[jtl_show].sort_values("timestamp", ascending=False).head(500)
+
+        # Summary badge above table
+        total_req  = len(jtl_df)
+        failed_req = int((jtl_df["success"].astype(str).str.lower() == "false").sum())
+        err_pct    = failed_req / max(1, total_req) * 100
+        has_assert = "failure_message" in jtl_df.columns and jtl_df["failure_message"].astype(str).str.strip().ne("").any()
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Requests",  f"{total_req:,}")
+        c2.metric("Failed Requests", f"{failed_req:,}")
+        c3.metric("Error Rate",      f"{err_pct:.2f}%")
+        c4.metric("Assertion Fails", "Yes" if has_assert else "No")
+
+        st.dataframe(
+            jtl_display,
+            use_container_width=True,
+            height=340,
+            column_config={
+                "timestamp":        st.column_config.DatetimeColumn("Timestamp", format="HH:mm:ss.SSS"),
+                "response_time_ms": st.column_config.NumberColumn("RT (ms)", format="%.1f"),
+                "latency_ms":       st.column_config.NumberColumn("Latency (ms)", format="%.1f"),
+                "connect_ms":       st.column_config.NumberColumn("Connect (ms)", format="%.1f"),
+                "bytes":            st.column_config.NumberColumn("Bytes"),
+                "success":          st.column_config.TextColumn("Success"),
+                "failure_message":  st.column_config.TextColumn("Assertion Failure"),
+            },
+        )
+
+        # Failure breakdown by label
+        if failed_req > 0:
+            st.markdown("**Failure breakdown by transaction label:**")
+            fail_df = (
+                jtl_df[jtl_df["success"].astype(str).str.lower() == "false"]
+                .groupby("label")
+                .agg(failures=("success", "count"))
+                .sort_values("failures", ascending=False)
+                .reset_index()
+            )
+            st.dataframe(fail_df, use_container_width=True, height=200)
+
+with tab3:
     st.dataframe(
         ts_df.sort_values("timestamp", ascending=False).head(200),
         use_container_width=True,
         height=300,
     )
 
-with tab3:
+with tab4:
     if storms.empty:
         st.info("No GC storms detected with current thresholds.")
     else:
